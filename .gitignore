@@ -1,0 +1,4 @@
+telemetry/
+__pycache__/
+*.log
+*.tmp
