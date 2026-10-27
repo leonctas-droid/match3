@@ -2,14 +2,24 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>急速消消乐</title>
+<!-- PWA：添加到主屏幕 + 离线 -->
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#12131c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="急速消消乐">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon-192.png">
 <style>
   :root { --bg:#12131c; --panel:#1c1e2b; --text:#eef0ff; --dim:#8a8fb0; --gold:#ffd24a; --red:#ff4d5e; }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html,body { margin:0; height:100%; background:var(--bg); color:var(--text); font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif; overflow:hidden; user-select:none; touch-action:none; }
   #bg { position:fixed; inset:0; width:100%; height:100%; z-index:0; }
-  #app { position:relative; z-index:1; display:flex; flex-direction:column; align-items:center; height:100%; padding:10px 12px; gap:8px; }
+  #app { position:relative; z-index:1; display:flex; flex-direction:column; align-items:center; height:100%; gap:8px;
+    padding:calc(10px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left)); }
   #hud { width:100%; max-width:520px; display:flex; flex-direction:column; gap:6px; }
   .row { display:flex; justify-content:space-between; align-items:flex-end; }
   .lbl { font-size:12px; color:var(--dim); }
@@ -46,6 +56,11 @@
   #tel { position:fixed; right:8px; bottom:6px; font-size:11px; color:var(--dim); }
   #tel i { display:inline-block; width:7px; height:7px; border-radius:50%; background:#555; margin-right:4px; }
   #tel.ok i { background:#3ddc84; }
+  #tel.local i { background:#5c9bff; }
+  .btn2 { background:rgba(255,255,255,.08); color:var(--text); border:1px solid rgba(255,255,255,.25); font-size:15px; font-weight:700; padding:9px 22px; border-radius:12px; cursor:pointer; font-family:inherit; }
+  .btn2:active { transform:translateY(2px); }
+  #sendMsg { color:#9fffc8; font-size:13px; min-height:18px; }
+  @media (max-height:720px) { #endOv { gap:8px; } #endOv h1 { font-size:24px; } .stats { font-size:13px; gap:2px 14px; } }
 </style>
 </head>
 <body>
@@ -82,6 +97,7 @@
       <b>2:30 决战妖王 —— 打败它才算通关！</b></p>
       <button class="btn" id="startBtn">开始</button>
       <div class="link" id="resetTut">重置新手教学</div>
+      <div class="link" id="sendLast" style="display:none">发送上一局给 Claude</div>
     </div>
     <div class="overlay hide" id="pauseOv"><h1>已暂停</h1><p>点击任意位置继续</p></div>
     <div class="overlay hide" id="endOv">
@@ -90,6 +106,8 @@
       <div id="endBest" style="color:var(--dim);font-size:14px"></div>
       <div class="stats" id="endStats"></div>
       <button class="btn" id="againBtn">再来一局</button>
+      <button class="btn2" id="sendBtn">发送这局给 Claude</button>
+      <div id="sendMsg"></div>
     </div>
   </div>
 </div>
@@ -155,23 +173,76 @@ const SPELL_NAMES = ['火球', '冰封', '护盾', '雷击', '毒雾', '风刃']
 function numColors(t) { return t < 50 ? 5 : 6; }
 
 // ================= 遥测 =================
+// 两条路：① 用 start.bat 开(本机 8765)时每秒 POST 给 server.py；
+//        ② 每局同时记一份在本机 localStorage(m3_runs，留最近 RUNS_KEEP 局)，手机上局后点「发送这局给 Claude」分享出去。
+const RUNS_KEEP = 5, SNAP_EVERY = 5, SAVE_EVERY = 10;   // 局内快照间隔 / 存盘间隔(秒)
 const Tel = {
-  on: location.protocol.startsWith('http'), fails: 0, events: [], errors: [],
+  on: location.protocol.startsWith('http') && (['localhost', '127.0.0.1'].includes(location.hostname) || location.port === '8765'),
+  fails: 0, events: [], errors: [], rec: null, snapT: 0, saveT: 0,
   ev(type, data) {
     const d = Object.assign({}, data);
     if ('type' in d) { d.enemy = d.type; delete d.type; }   // 敌人类型放 enemy 字段，别覆盖事件类型
-    this.events.push(Object.assign({ run: G.run, t: +G.t.toFixed(2), wall: new Date().toISOString(), type }, d));
+    const e = Object.assign({ run: G.run, t: +G.t.toFixed(2), wall: new Date().toISOString(), type }, d);
+    if (this.on) this.events.push(e);
+    if (this.rec) this.rec.events.push(e);
   },
-  err(e) { this.errors.push(e); console.error(e); },
+  err(e) { if (this.on) this.errors.push(e); if (this.rec) this.rec.errors.push(Object.assign({ wall: new Date().toISOString() }, e)); console.error(e); },
+  begin(run) {   // newGame 里调用：开一份新的本局记录
+    this.rec = { run, game: '急速消消乐', ua: navigator.userAgent, screen: [screen.width, screen.height, window.devicePixelRatio || 1],
+                 standalone: !!(window.matchMedia && matchMedia('(display-mode: standalone)').matches) || !!navigator.standalone,
+                 events: [], errors: [], snaps: [] };
+    this.snapT = 0; this.saveT = 0;
+  },
+  tick(dt) {     // 每秒一次：局内定期留快照 + 存盘(防止中途关掉 App 丢记录)
+    if (!this.rec || this.rec.run !== G.run || G.state === 'menu') return;
+    if (G.state !== 'pause' && (this.snapT += dt) >= SNAP_EVERY) { this.snapT = 0; this.rec.snaps.push(snapshot()); }
+    if ((this.saveT += dt) >= SAVE_EVERY) { this.saveT = 0; this.save(); }
+  },
+  save() {
+    if (!this.rec) return;
+    try {
+      const runs = loadRuns().filter(r => r.run !== this.rec.run);
+      runs.push(this.rec);
+      while (runs.length > RUNS_KEEP) runs.shift();
+      try { localStorage.setItem('m3_runs', JSON.stringify(runs)); }
+      catch (e) { localStorage.setItem('m3_runs', JSON.stringify(runs.slice(-1))); }   // 满了就只留当前这局
+    } catch (e) { console.error(e); }
+  },
   flush() {
+    this.tick(1);
     const el = document.getElementById('tel');
-    if (!this.on) { el.className = ''; el.lastChild.textContent = '遥测离线(请用 start.bat 打开)'; return; }
+    if (!this.on) { el.className = 'local'; el.lastChild.textContent = '遥测存在本机 · 局后可发送'; return; }
     const body = JSON.stringify({ snapshot: snapshot(), events: this.events.splice(0), errors: this.errors.splice(0) });
     fetch('/t', { method:'POST', headers:{'Content-Type':'application/json'}, body })
-      .then(r => { this.fails = 0; el.className = 'ok'; el.lastChild.textContent = '遥测已连接'; })
+      .then(r => { if (!r.ok) throw new Error(r.status); this.fails = 0; el.className = 'ok'; el.lastChild.textContent = '遥测已连接'; })
       .catch(() => { if (++this.fails > 3) { this.on = false; } el.className = ''; });
   }
 };
+function loadRuns() { try { return JSON.parse(localStorage.getItem('m3_runs') || '[]'); } catch (e) { return []; } }
+window.addEventListener('pagehide', () => Tel.save());
+document.addEventListener('visibilitychange', () => { if (document.hidden) Tel.save(); });
+
+// 把一局记录分享出去：优先系统分享面板(带文件) → 分享文字 → 复制到剪贴板 → 下载文件
+async function sendRun(rec, msgEl) {
+  const say = s => { if (msgEl) msgEl.textContent = s; };
+  if (!rec) { say('没有可发送的对局记录'); return; }
+  const text = JSON.stringify(rec);
+  const name = 'match3_' + rec.run + '.json';
+  try {
+    const file = new File([text], name, { type: 'application/json' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: '急速消消乐对局记录' });
+      say('已发送 ✔ 把文件交给 Claude 就行'); return;
+    }
+  } catch (e) { if (e.name === 'AbortError') { say('已取消'); return; } }
+  try { await navigator.clipboard.writeText(text); say('已复制到剪贴板，粘贴发给 Claude 就行'); return; } catch (e) {}
+  try {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' })); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    say('已下载 ' + name);
+  } catch (e) { say('发送失败：' + e.message); }
+}
 window.addEventListener('error', e => Tel.err({ kind:'error', msg:e.message, src:e.filename, line:e.lineno, col:e.colno, stack:e.error && e.error.stack }));
 window.addEventListener('unhandledrejection', e => Tel.err({ kind:'rejection', msg:String(e.reason) }));
 
@@ -230,6 +301,8 @@ function newGame() {
   G.preview = makePreview();
   G.plank.vis = plankTop();
   if (G.newbie) setTimeout(() => { if (G.newbie && G.state === 'play') banner('新手节奏：前 60 秒上涨变慢', '#9fffc8'); }, 400);
+  Tel.begin(G.run);
+  $('sendMsg').textContent = '';
   Tel.ev('game_start', { newbie: G.newbie, cols: COLS, rows: ROWS, midAt: MID_AT, finalAt: FINAL_AT, plankCols: PLANK_COLS });
   show('startOv', false); show('endOv', false); show('pauseOv', false);
 }
@@ -962,6 +1035,7 @@ function endGame(survived) {
   ].map(([a, b]) => `<span>${a}</span><b>${b}</b>`).join('');
   show('endOv', true);
   Tel.flush();
+  if (Tel.rec) { Tel.rec.result = { reason: G.reason, score: G.score, survived: +G.t.toFixed(1), newBest, stats: s }; Tel.rec.snaps.push(snapshot()); Tel.save(); }
 }
 
 // ================= 渲染 =================
@@ -1848,8 +1922,11 @@ $('resetTut').onclick = () => {
 function show(id, on) { $(id).classList.toggle('hide', !on); }
 $('startBtn').onclick = () => { audio.init(); newGame(); };
 $('againBtn').onclick = () => { audio.init(); newGame(); };
+$('sendBtn').onclick = () => sendRun(Tel.rec, $('sendMsg'));
+$('sendLast').onclick = () => { const runs = loadRuns(); sendRun(runs[runs.length - 1], null); };
+if (loadRuns().length) $('sendLast').style.display = '';
 function pause() { if (G.state === 'play') { G.state = 'pause'; show('pauseOv', true); Tel.ev('pause', {}); } }
-function resume() { if (G.state === 'pause') { G.state = 'play'; show('pauseOv', false); Tel.ev('resume', {}); } }
+function resume() { if (G.state === 'pause') { audio.init(); G.state = 'play'; show('pauseOv', false); Tel.ev('resume', {}); } }
 $('pauseOv').addEventListener('pointerdown', resume);
 window.addEventListener('blur', pause);
 document.addEventListener('visibilitychange', () => { if (document.hidden) pause(); });
@@ -1957,6 +2034,11 @@ function frame(now) {
 }
 layout();
 requestAnimationFrame(frame);
+
+// 离线缓存(sw.js)：只在 http(s) 下注册，file:// 打开时跳过
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  navigator.serviceWorker.register('sw.js').catch(e => Tel.err({ kind: 'sw', msg: e.message }));
+}
 </script>
 </body>
 </html>
